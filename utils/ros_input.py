@@ -4,13 +4,14 @@ from cv_bridge import CvBridge
 import cv2
 import os
 import numpy as np
+from datetime import datetime
 
 from tritonclient.grpc import service_pb2, service_pb2_grpc
 import tritonclient.grpc.model_config_pb2 as mc
 from utils.postprocess import extract_boxes_triton
 
 class RealSenseNode(object):
-    def __init__(self, grpc_stub, input_name, output_name, param, FLAGS, dtype, c, h, w):
+    def __init__(self, grpc_stub, input_name, output_name, param, FLAGS, dtype, c, h, w, batchsize):
         '''
         grpc_stub: gRPC stub to invoke ModelInfer() in this class
         input_name: Name of the input as described by the onnx converter
@@ -33,6 +34,9 @@ class RealSenseNode(object):
             self.input.shape.extend([h, w, c])
         else:
             self.input.shape.extend([c, h, w])
+
+        self.batchsize = batchsize
+        self.queue = []
 
         self.request = service_pb2.ModelInferRequest()
         self.request.model_name = FLAGS.model_name
@@ -61,19 +65,34 @@ class RealSenseNode(object):
         return [xtl, ytl, xbr, ybr]
 
     def callback(self, msg):
-        # rospy.loginfo('Image received...')
-        cv_image = self.br.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-        self.orig_size = cv_image.shape[0:2]
-        self.orig_image = cv_image.copy()
-        cv_image = cv2.resize(cv_image, (self.input.shape[1], self.input.shape[2]))
-        self.image = self.image_adjust(cv_image)
-        if self.image is not None:
-            self.request.ClearField("inputs")
+        #import pdb; pdb.set_trace()
+        if len(self.queue) < self.batchsize:
+            self.queue.append(msg)
+            return
+
+        #if self.image is not None:
+        else:
+            #import pdb; pdb.set_trace()
             self.request.ClearField("raw_input_contents")   # Flush the previous image contents
-            self.request.inputs.extend([self.input])
-            self.request.raw_input_contents.extend([self.image.tobytes()])
+
+            #t = datetime.now()
+            for msg in self.queue:
+                # rospy.loginfo('Image received...')
+                cv_image = self.br.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+                self.orig_size = cv_image.shape[0:2]
+                self.orig_image = cv_image.copy()
+                cv_image = cv2.resize(cv_image, (self.input.shape[1], self.input.shape[2]))
+                self.image = self.image_adjust(cv_image)
+
+                self.request.ClearField("inputs")
+                #self.request.ClearField("raw_input_contents")   # Flush the previous image contents
+                self.request.inputs.extend([self.input])
+                self.request.raw_input_contents.extend([self.image.tobytes()])
+
             self.response = self.stub.ModelInfer(self.request)  # Inference
+            #print(datetime.now() - t)
             self.prediction = extract_boxes_triton(self.response)
+            #print(self.class_names[int(self.prediction[0][-1])])
 
             for object in self.prediction[0]:  # predictions array has the order [x1,y1, x2,y2, confidence, confidence, class ID]
                 box = np.array(object[0:4], dtype=np.float32)
@@ -93,8 +112,10 @@ class RealSenseNode(object):
             self.msg_frame = self.br.cv2_to_imgmsg(self.orig_image, encoding="rgb8")
             self.msg_frame.header.stamp = rospy.Time.now()
             self.detection.publish(self.msg_frame)
-            # cv2.imshow('Prediction', cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR))
-            # cv2.waitKey()
+            cv2.imshow('Prediction', cv2.cvtColor(self.orig_image, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
+
+            self.queue = []
 
     def load_class_names(self, namesfile='./data/coco.names'):
         class_names = []
